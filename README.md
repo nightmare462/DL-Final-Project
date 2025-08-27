@@ -17,13 +17,3 @@ virtualenv --python=python3.10 atkpdm
 source atkpdm/bin/activate
 pip install -r requirements.txt
 ```
-
-## Cite
-```bibtex
-@inproceedings{shih2024atkpdm,
-  title     = {Pixel Is Not A Barrier: An Effective Evasion Attack for Pixel-Domain Diffusion Models},
-  author    = {Chun-Yen Shih and Li-Xuan Peng and Jia-Wei Liao and Ernie Chu and Cheng-Fu Chou and Jun-Cheng Chen},
-  booktitle = {Annual AAAI Conference on Artificial Intelligence (AAAI)},
-  year      = {2025},
-}
-```
