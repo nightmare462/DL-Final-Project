@@ -25,7 +25,7 @@ from tqdm import tqdm, trange
 from utils.attack_validator import AttackValidator
 from utils.utils import to_pil, visualize_feature_maps
 torch.cuda.empty_cache()
-device = "cuda:1"
+device = "cuda:0"
 
 transform = torchvision.transforms.Compose([
         torchvision.transforms.ToTensor(),
@@ -36,7 +36,7 @@ transform = torchvision.transforms.Compose([
 class FidelityLoss(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).to("cuda")
+        vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).to(device)
         vgg16.eval()
         self.vgg16 = vgg16.features
         self.normalize = transforms.Normalize(
@@ -231,8 +231,9 @@ def atk_pdm_protect_image(args, hparams=None):
     victim_unet_input_shape = [args.batch_size, victim_unet.config.in_channels, victim_unet.sample_size, victim_unet.sample_size]
     
     #Define loss functions
-    lpips_loss_fn = lpips.LPIPS(net='vgg').to(device).eval()
-    for p in lpips_loss_fn.parameters():
+    #fidelity_loss_fn = lpips.LPIPS(net='vgg').to(device).eval()
+    fidelity_loss_fn = lpips.LPIPS(net='alex').to(device).eval()
+    for p in fidelity_loss_fn.parameters():
         p.requires_grad_(False)
     feature_attacking_loss_fn = FeatureAttackingLoss()
     # fidelity_loss_fn = FidelityLoss()
@@ -312,7 +313,7 @@ def atk_pdm_protect_image(args, hparams=None):
         feature_attacking_loss = feature_attacking_coef * feature_attacking_loss_fn(clean_record_features[:3], protected_record_features[0:3])
         feature_attacking_loss.requires_grad_(True)
         
-        fidelity_loss = fidelity_coef * lpips_loss_fn(protected_image, clean_image).mean() # modified!!!
+        fidelity_loss = fidelity_coef * fidelity_loss_fn(protected_image, clean_image).mean() # modified!!!
         fidelity_loss.requires_grad_(True)
         
         # For optimization trend visualization only, not used for optimization
@@ -326,7 +327,17 @@ def atk_pdm_protect_image(args, hparams=None):
         feature_attacking_loss.backward()
         feature_attacking_grad = protected_latent.grad.clone()
         
-        protected_latent.data = protected_latent.data - feature_attacking_grad.sign() * step_size 
+        #protected_latent.data = protected_latent.data - feature_attacking_grad.sign() * step_size
+        if args.update_rule == 'sign':
+            step_dir = feature_attacking_grad.sign()
+        elif args.update_rule == 'l2':
+            g = feature_attacking_grad
+            g_norm = g.norm(p=2).clamp(min=1e-8)
+            step_dir = g / g_norm
+        else:
+            raise NotImplementedError(args.update_rule)
+
+        protected_latent.data = protected_latent.data - step_dir * step_size
         
         # Update protected latent to minimize the fidelity loss, here we limit the update times to avoid infinite loop
         update_times = 0
@@ -338,7 +349,7 @@ def atk_pdm_protect_image(args, hparams=None):
             protected_image = F.interpolate(protected_image, size=victim_unet_input_shape[-2:], mode='bilinear')
             protected_image = repeat(protected_image[0], 'c h w -> b c h w', b=args.batch_size).to(device)
                 
-            fidelity_loss = fidelity_coef * lpips_loss_fn(protected_image, clean_image).mean() # modified!!!
+            fidelity_loss = fidelity_coef * fidelity_loss_fn(protected_image, clean_image).mean() # modified!!!
             
             fidelity_loss.retain_grad()
             fidelity_loss.backward(retain_graph=True)
@@ -388,6 +399,9 @@ def atk_pdm_protect_image(args, hparams=None):
     plt.tight_layout()
     plt.savefig(loss_plot_path, dpi=150)
     plt.close()
+
+    torch.save(best_protected_latent.detach().cpu(), f"{args.save_folder_path}/protected_latent.pt")
+    torch.save(best_protected_image.detach().cpu(), f"{args.save_folder_path}/protected_image_tensor.pt")
     
     print("Getting final validation result...")
     attack_validator.edit(args, best_protected_pil_image, args.optim_steps, sdedit_t=args.sdedit_t, do_clean_sample=True)
@@ -397,24 +411,25 @@ def atk_pdm_protect_image(args, hparams=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--protected_image_path', default="./to_protect_images/cat/1.png", help="Path to image to be protected (optimized), recommended: ./to_protect_images/celeba or ./to_protect_images/cat")
-    parser.add_argument('--save_folder_path', default="./test2", help="Path to save protected results and analysis")
+    parser.add_argument('--save_folder_path', default="./LPIPS_300_l2", help="Path to save protected results and analysis")
     
     parser.add_argument('--protection_mode', default="vae", help="what protection method is acheived", choices=["vae", "pixel"])
     parser.add_argument('--victim_model_type', default="unconditional_pdm", help="victim model type for attack validation", choices=["unconditional_pdm","ldm", "IF"])
     parser.add_argument('--random_start_eps', default=10e-5, help="Initial small perturbation added to image before optimization")
     parser.add_argument('--VAE_unet_size', default=512, help="VAE's unet sample size", choices=[256, 512])
-    parser.add_argument('--optim_steps', default=100, type=int, help="Number of optimization steps")
-    parser.add_argument('--validation_period', default=100, type=int, help="validation period, for every n steps, perform an attack validation")
+    parser.add_argument('--optim_steps', default=300, type=int, help="Number of optimization steps")
+    parser.add_argument('--validation_period', default=300, type=int, help="validation period, for every n steps, perform an attack validation")
     parser.add_argument('--feature_maps_viz_period', default=10, type=int, help="feature maps visualization period, for every n steps, visualize the current recorded feature maps")
-    parser.add_argument('--step_size', default=0.5, type=float, help="step size of each attack optimization")
+    parser.add_argument('--step_size', default=0.25, type=float, help="step size of each attack optimization")
     parser.add_argument('--batch_size', default=1, type=int)
     parser.add_argument('--attack_validator_batch_size', default=5, type=int, help="batch size for attack validator, we generate 5 varitions of the clean and protected images for attack validation in the paper")
-    
+
     parser.add_argument('--victim_model_id', default="google/ddpm-cat-256", help='victim_model_id', choices=["google/ddpm-ema-celebahq-256", "google/ddpm-ema-church-256", "google/ddpm-cat-256"])
     parser.add_argument('--sdedit_t', default=500, help="sdedit_t forward diffusion timestep for attack validation")
     parser.add_argument('--enable_attack_analysis', default=True, help="Perform attack analysis over sampling steps")
     parser.add_argument('--hparams_config', help="Hyper-parameters else")
-    
+    parser.add_argument('--update_rule', default='l2', choices=['sign', 'l2'])
+
     args = parser.parse_args()
     
     if args.victim_model_id == "google/ddpm-ema-celebahq-256":
@@ -424,9 +439,9 @@ if __name__ == '__main__':
     elif args.victim_model_id == "google/ddpm-cat-256":
         args.dataset = "cat"
     
-    feature_attacking_coef = -100 
-    fidelity_coef = 5 # 70
-    fidelity_budget = 100
+    feature_attacking_coef = -12
+    fidelity_coef = 100
+    fidelity_budget = 0.05
     fidelity_update_times_max = 10
             
     args.hparams_config = {
@@ -437,6 +452,3 @@ if __name__ == '__main__':
     }
 
     atk_pdm_protect_image(args)
-       
-    
-    
